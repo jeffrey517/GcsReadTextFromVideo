@@ -1,4 +1,5 @@
 import io
+import os
 import cv2
 import re
 import subprocess
@@ -61,10 +62,12 @@ def stream_video_from_gcs(gcs_uri: str):
     assert gcs_uri.startswith("gs://"), "Path must be a GCS URI (gs://bucket/file.mp4)"
     bucket_name, blob_name = gcs_uri[5:].split("/", 1)
 
+    cloud_run_service_account_email = os.environ.get("K_SERVICE_ACCOUNT", "30892104547-compute@developer.gserviceaccount.com")
+
     # Get signed URL
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    url = blob.generate_signed_url(version="v4", expiration=3600, method="GET")
+    url = blob.generate_signed_url(version="v4", expiration=3600, method="GET", service_account_email=cloud_run_service_account_email)
 
     # FFmpeg command
     ffmpeg_cmd = [
