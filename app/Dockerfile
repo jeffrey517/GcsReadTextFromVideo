@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 # Install system deps
 RUN apt-get update && apt-get install -y ffmpeg libsm6 libxext6 && rm -rf /var/lib/apt/lists/*
+RUN pip install yt-dlp
 
 # Install Python deps
 COPY requirements.txt .

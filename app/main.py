@@ -1,14 +1,17 @@
 import tempfile
 import os
-from google.cloud import vision, storage
-import cv2
+import subprocess
 import re
+import cv2
+import requests
 from flask import Flask, request, jsonify
+from google.cloud import vision, storage
 
 app = Flask(__name__)
 FRAME_INTERVAL = 30
-BOTTOM_IGNORE_RATIO = 0.25
-UNWANTED = ["tiktok", "tik tok"]
+BOTTOM_IGNORE_RATIO = 0.25   # ignore bottom 25% (TikTok watermark area)
+TOP_IGNORE_RATIO = 0.15      # ignore top 15% (username/music text area)
+UNWANTED = ["tiktok", "tik tok", "original sound", "music"]
 MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB
 
 vision_client = vision.ImageAnnotatorClient()
@@ -33,13 +36,17 @@ def clean_text(response, frame_height):
                 for word in para.words:
                     word_text = "".join([s.text for s in word.symbols])
                     ymin = min(v.y for v in word.bounding_box.vertices)
+                    if ymin < frame_height * TOP_IGNORE_RATIO:
+                        continue
                     if ymin > frame_height * (1 - BOTTOM_IGNORE_RATIO):
                         continue
                     line_words.append(word_text)
+
                 if line_words:
                     line_text = " ".join(line_words)
                     if not is_unwanted(line_text):
                         words.append(line_text)
+
     seen = set()
     deduped = []
     for line in words:
@@ -47,6 +54,7 @@ def clean_text(response, frame_height):
         if norm not in seen:
             seen.add(norm)
             deduped.append(line)
+
     return " ".join(deduped)
 
 
@@ -55,7 +63,6 @@ def download_gcs_to_tempfile(gcs_uri: str) -> str:
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
 
-    # size check
     blob.reload()
     if blob.size is None:
         raise ValueError("Could not determine object size.")
@@ -67,10 +74,23 @@ def download_gcs_to_tempfile(gcs_uri: str) -> str:
     return temp_file.name
 
 
-def process_video_local(gcs_uri: str):
-    video_path = download_gcs_to_tempfile(gcs_uri)
+def download_tiktok_to_tempfile(url: str) -> str:
+    """Download TikTok video via yt-dlp into a temp file."""
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    try:
+        # yt-dlp must be installed in your Dockerfile
+        subprocess.run(
+            ["yt-dlp", "-o", temp_file.name, url],
+            check=True,
+            capture_output=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise ValueError(f"Failed to download TikTok video: {e.stderr.decode()}")
+    return temp_file.name
+
+
+def process_video_local(video_path: str):
     cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_num = 0
     last_text = None
@@ -104,14 +124,23 @@ def process_video_local(gcs_uri: str):
 @app.route("/", methods=["POST"])
 def run_video_ocr():
     data = request.get_json(force=True)
-    gcs_uri = data.get("gcs_uri")
-    if not gcs_uri:
-        return jsonify({"error": "Missing gcs_uri"}), 400
+    source = data.get("gcs_uri") or data.get("tiktok_url")
+
+    if not source:
+        return jsonify({"error": "Missing gcs_uri or tiktok_url"}), 400
+
     try:
-        results = process_video_local(gcs_uri)
+        if source.startswith("gs://"):
+            video_path = download_gcs_to_tempfile(source)
+        elif "tiktok.com" in source:
+            video_path = download_tiktok_to_tempfile(source)
+        else:
+            return jsonify({"error": "Unsupported source type"}), 400
+
+        results = process_video_local(video_path)
         return jsonify(results)
+
     except ValueError as ve:
-        # specifically catch large file error
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
