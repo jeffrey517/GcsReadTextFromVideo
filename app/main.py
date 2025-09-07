@@ -7,6 +7,7 @@ import numpy as np
 from flask import Flask, request, jsonify
 from google.cloud import vision
 from google.cloud import storage
+import tempfile
 
 # --- CONFIG ---
 FRAME_INTERVAL = 30   # process every 30th frame
@@ -84,6 +85,14 @@ def stream_video_from_gcs(gcs_uri: str):
     )
     return process
 
+def download_gcs_to_tempfile(gcs_uri: str) -> str:
+    bucket_name, blob_name = gcs_uri[5:].split("/", 1)
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    blob.download_to_filename(temp.name)
+    return temp.name
 
 def process_video(gcs_uri: str):
     process = stream_video_from_gcs(gcs_uri)
@@ -92,7 +101,8 @@ def process_video(gcs_uri: str):
     bucket_name, blob_name = gcs_uri[5:].split("/", 1)
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    url = blob.generate_signed_url(version="v4", expiration=3600, method="GET")
+    cloud_run_service_account_email = os.environ.get("K_SERVICE_ACCOUNT", "30892104547-compute@developer.gserviceaccount.com")
+    url = blob.generate_signed_url(version="v4", expiration=3600, method="GET", service_account_email=cloud_run_service_account_email)
     cap = cv2.VideoCapture(url)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
