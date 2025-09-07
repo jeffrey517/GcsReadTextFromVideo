@@ -90,14 +90,22 @@ def download_tiktok_to_tempfile(url: str) -> str:
     try:
         # Get metadata + direct URL with headers
         result = subprocess.run(
-            ["yt-dlp", "--dump-json", "-o", "-", url],
+            ["yt-dlp", "--dump-json", url],
             check=True, capture_output=True, text=True
         )
+
+        if not result.stdout.strip():
+            raise ValueError("yt-dlp returned no JSON output. Video may be unavailable.")
+
         info = json.loads(result.stdout)
-        direct_url = info["url"]
+        direct_url = info.get("url")
         headers = info.get("http_headers", {})
 
+        if not direct_url:
+            raise ValueError("Could not extract direct video URL from TikTok.")
+
         # Stream download
+        import requests
         with requests.get(direct_url, headers=headers, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(temp_file.name, "wb") as f:
@@ -105,7 +113,7 @@ def download_tiktok_to_tempfile(url: str) -> str:
                     f.write(chunk)
 
     except subprocess.CalledProcessError as e:
-        raise ValueError(f"yt-dlp failed: {e.stderr.decode()}")
+        raise ValueError(f"yt-dlp failed: {e.stderr.decode().strip()}")
     except Exception as e:
         raise ValueError(f"Failed to download TikTok video: {str(e)}")
 
