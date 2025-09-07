@@ -84,38 +84,36 @@ def download_gcs_to_tempfile(gcs_uri: str) -> str:
 
 
 def download_tiktok_to_tempfile(url: str) -> str:
-    """Download TikTok video via yt-dlp + requests into a temp file."""
+    """Download TikTok video via yt-dlp into a local temp file."""
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-
+    
     try:
-        # Get metadata + direct URL with headers
-        result = subprocess.run(
-            ["yt-dlp", "--dump-json", url],
-            check=True, capture_output=True, text=True
+        subprocess.run(
+            [
+                "yt-dlp",
+                "-f", "mp4",
+                "--merge-output-format", "mp4",
+                "-o", temp_file.name,
+                "--no-warnings",
+                "--quiet",
+                "--socket-timeout", "30",
+                "--user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                url
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180
         )
-
-        if not result.stdout.strip():
-            raise ValueError("yt-dlp returned no JSON output. Video may be unavailable.")
-
-        info = json.loads(result.stdout)
-        direct_url = info.get("url")
-        headers = info.get("http_headers", {})
-
-        if not direct_url:
-            raise ValueError("Could not extract direct video URL from TikTok.")
-
-        # Stream download
-        import requests
-        with requests.get(direct_url, headers=headers, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(temp_file.name, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
     except subprocess.CalledProcessError as e:
-        raise ValueError(f"yt-dlp failed: {e.stderr.decode().strip()}")
-    except Exception as e:
-        raise ValueError(f"Failed to download TikTok video: {str(e)}")
+        raise ValueError(f"TikTok download failed: {e.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        raise ValueError("TikTok download timed out.")
+
+    if not os.path.exists(temp_file.name) or os.path.getsize(temp_file.name) == 0:
+        raise ValueError("TikTok download resulted in empty file.")
 
     return temp_file.name
 
