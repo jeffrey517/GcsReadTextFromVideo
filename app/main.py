@@ -1,23 +1,21 @@
 import tempfile
 import os
-import subprocess
 import re
-import json
 import cv2
-import requests
 from flask import Flask, request, jsonify
 from google.cloud import vision, storage
+from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
 
-# Parameters
-FRAME_INTERVAL = 30
-BOTTOM_IGNORE_RATIO = 0.25   # ignore bottom 25% (watermarks, captions)
-TOP_IGNORE_RATIO = 0.15      # ignore top 15% (username/music text area)
+# --- CONFIG ---
+FRAME_INTERVAL = 30           # process every 30th frame
+BOTTOM_IGNORE_RATIO = 0.25    # ignore bottom 25% (watermarks)
+TOP_IGNORE_RATIO = 0.15       # ignore top 15% (username/music)
 UNWANTED = ["tiktok", "tik tok", "original sound", "music"]
 MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB
+# ----------------
 
-# Clients
 vision_client = vision.ImageAnnotatorClient()
 storage_client = storage.Client()
 
@@ -26,7 +24,7 @@ def is_unwanted(text: str) -> bool:
     text_norm = text.lower().replace(" ", "")
     if any(bad.replace(" ", "") in text_norm for bad in UNWANTED):
         return True
-    if re.match(r"@[\w\d_]+", text_norm):  # usernames
+    if re.match(r"@[\w\d_]+", text_norm):
         return True
     return False
 
@@ -54,7 +52,7 @@ def clean_text(response, frame_height):
                     if not is_unwanted(line_text):
                         words.append(line_text)
 
-    # Deduplicate
+    # Deduplicate lines
     seen = set()
     deduped = []
     for line in words:
@@ -67,11 +65,12 @@ def clean_text(response, frame_height):
 
 
 def download_gcs_to_tempfile(gcs_uri: str) -> str:
-    """Download a GCS object into a temp file (with size check)."""
+    """Download video from GCS to a local temp file with size check."""
     bucket_name, blob_name = gcs_uri[5:].split("/", 1)
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
 
+    # Check size
     blob.reload()
     if blob.size is None:
         raise ValueError("Could not determine object size.")
@@ -82,44 +81,36 @@ def download_gcs_to_tempfile(gcs_uri: str) -> str:
     blob.download_to_filename(temp_file.name)
     return temp_file.name
 
-
-def download_tiktok_to_tempfile(url: str) -> str:
-    """Download TikTok video via yt-dlp into a local temp file."""
+def download_tiktok_video_local(url: str) -> str:
+    """
+    Download TikTok video to a local temp file using yt-dlp.
+    Returns the path to the local temp file.
+    """
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    
+
+    ydl_opts = {
+        'format': 'mp4',               # download as MP4
+        'outtmpl': temp_file.name,     # write directly to temp file
+        'quiet': True,
+        'merge_output_format': 'mp4',  # merge fragments if needed
+        'noplaylist': True
+    }
+
     try:
-        subprocess.run(
-            [
-                "yt-dlp",
-                "-f", "mp4",
-                "--merge-output-format", "mp4",
-                "-o", temp_file.name,
-                "--no-warnings",
-                "--quiet",
-                "--socket-timeout", "30",
-                "--user-agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                url
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
-    except subprocess.CalledProcessError as e:
-        raise ValueError(f"TikTok download failed: {e.stderr.strip()}")
-    except subprocess.TimeoutExpired:
-        raise ValueError("TikTok download timed out.")
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
 
-    if not os.path.exists(temp_file.name) or os.path.getsize(temp_file.name) == 0:
-        raise ValueError("TikTok download resulted in empty file.")
+        if not info or not info.get("url"):
+            raise ValueError("Failed to download TikTok video: no URL found.")
+        return temp_file.name
 
-    return temp_file.name
-
+    except Exception as e:
+        if temp_file and temp_file.name and os.path.exists(temp_file.name):
+            os.remove(temp_file.name)
+        raise ValueError(f"Failed to download TikTok video: {str(e)}")
 
 def process_video_local(video_path: str):
-    """Run OCR frame-by-frame on a local video file."""
+    """Run OCR on a local video file."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise ValueError("OpenCV failed to open the video file.")
@@ -139,7 +130,6 @@ def process_video_local(video_path: str):
                 success, encoded = cv2.imencode(".jpg", frame)
                 if not success:
                     continue
-
                 image = vision.Image(content=encoded.tobytes())
                 response = vision_client.text_detection(image=image)
 
@@ -161,22 +151,19 @@ def process_video_local(video_path: str):
 @app.route("/", methods=["POST"])
 def run_video_ocr():
     data = request.get_json(force=True)
-    source = data.get("video_uri")
+    gcs_uri = data.get("gcs_uri")
 
-    if not source:
-        return jsonify({"error": "Missing video_uri"}), 400
+    if not gcs_uri:
+        return jsonify({"error": "Missing gcs_uri"}), 400
 
     try:
-        if source.startswith("gs://"):
-            video_path = download_gcs_to_tempfile(source)
-        elif "tiktok.com" in source:
-            video_path = download_tiktok_to_tempfile(source)
+        if gcs_uri.startswith("gs://"):
+            video_path = download_gcs_to_tempfile(gcs_uri)
         else:
-            return jsonify({"error": "Unsupported source"}), 400
+            video_path = download_tiktok_video_local(gcs_uri)
 
         results = process_video_local(video_path)
         return jsonify(results)
-
     except ValueError as ve:
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
