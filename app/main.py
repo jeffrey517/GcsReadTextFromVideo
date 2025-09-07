@@ -1,20 +1,19 @@
 import os
 import re
 import cv2
-import tempfile
 import subprocess
 from flask import Flask, request, jsonify
 from google.cloud import vision, storage
 
 app = Flask(__name__)
 
-# ---- OCR tuning (TikTok-friendly) ----
+# ---- OCR tuning ----
 FRAME_INTERVAL = 30
-BOTTOM_IGNORE_RATIO = 0.25   # ignore bottom 25% (watermark area)
-TOP_IGNORE_RATIO = 0.15      # ignore top 15% (username/music overlays)
+BOTTOM_IGNORE_RATIO = 0.25   # ignore bottom 25% (watermark)
+TOP_IGNORE_RATIO = 0.15      # ignore top 15% (user/music overlays)
 UNWANTED = ["tiktok", "tik tok", "original sound", "music"]
 MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB
-# -------------------------------------
+# ---------------------
 
 vision_client = vision.ImageAnnotatorClient()
 storage_client = storage.Client()
@@ -38,7 +37,6 @@ def clean_text(response, frame_height):
                 for word in para.words:
                     word_text = "".join([s.text for s in word.symbols])
                     ymin = min(v.y for v in word.bounding_box.vertices)
-                    # skip top/bottom overlays common on TikTok
                     if ymin < frame_height * TOP_IGNORE_RATIO:
                         continue
                     if ymin > frame_height * (1 - BOTTOM_IGNORE_RATIO):
@@ -50,7 +48,7 @@ def clean_text(response, frame_height):
                     if not is_unwanted(line_text):
                         words.append(line_text)
 
-    # de-dupe by normalized content
+    # de-dupe
     seen, deduped = set(), []
     for line in words:
         norm = line.lower().replace(" ", "")
@@ -60,63 +58,30 @@ def clean_text(response, frame_height):
     return " ".join(deduped)
 
 
-def download_gcs_to_tempfile(gcs_uri: str) -> str:
-    """Download gs:// object to a unique temp file, enforcing 512MB limit."""
-    bucket_name, blob_name = gcs_uri[5:].split("/", 1)
-    blob = storage_client.bucket(bucket_name).blob(blob_name)
-    blob.reload()
-
-    if blob.size is None:
-        raise ValueError("Could not determine object size.")
-    if blob.size > MAX_VIDEO_SIZE:
-        raise ValueError(f"Video too large: {blob.size/1024/1024:.2f} MB (limit 512 MB)")
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    blob.download_to_filename(tmp.name)
-    return tmp.name
-
-
-def download_tiktok_to_tempfile(url: str) -> str:
-    """
-    Download a TikTok video to a temp file using yt-dlp.
-    Adds timeout, UA header, and max-filesize to avoid hangs/oversized files.
-    """
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+def get_tiktok_direct_url(url: str) -> str:
+    """Use yt-dlp to resolve TikTok into a playable direct video URL."""
     cmd = [
-        "python", "-m", "yt_dlp",  # module form is more reliable than 'yt-dlp' on PATH
-        "-o", tmp.name,
-        "--no-warnings", "-q", "--no-progress",
-        "--max-filesize", "512M",
-        "--socket-timeout", "15",
-        "--user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "--restrict-filenames",
+        "yt-dlp", "-g",
+        "--no-warnings", "--quiet", "--no-progress",
         url,
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
-    except FileNotFoundError:
-        # yt-dlp not installed in the image
-        if os.path.exists(tmp.name):
-            os.remove(tmp.name)
-        raise ValueError("yt-dlp not found. Add 'pip install yt-dlp' in your Dockerfile.")
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+        direct_url = result.stdout.strip().splitlines()[0]
+        if not direct_url.startswith("http"):
+            raise ValueError("Failed to extract direct video URL from TikTok.")
+        return direct_url
     except subprocess.TimeoutExpired:
-        if os.path.exists(tmp.name):
-            os.remove(tmp.name)
-        raise ValueError("Timed out downloading TikTok (try a shorter video).")
+        raise ValueError("Timed out resolving TikTok URL.")
     except subprocess.CalledProcessError as e:
-        if os.path.exists(tmp.name):
-            os.remove(tmp.name)
-        # pass along stderr for easier debugging
-        raise ValueError(f"TikTok download failed: {e.stderr.strip() or 'unknown error'}")
-    return tmp.name
+        raise ValueError(f"yt-dlp failed: {e.stderr.strip() or 'unknown error'}")
 
 
-def process_video_local(video_path: str):
-    cap = cv2.VideoCapture(video_path)
+def process_video_stream(video_url: str):
+    """Read video frames directly from URL (TikTok or GCS signed URL)."""
+    cap = cv2.VideoCapture(video_url)
     if not cap.isOpened():
-        raise ValueError("OpenCV failed to open the downloaded video.")
+        raise ValueError("Failed to open video stream with OpenCV.")
 
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_num, last_text = 0, None
@@ -142,8 +107,6 @@ def process_video_local(video_path: str):
             frame_num += 1
     finally:
         cap.release()
-        if os.path.exists(video_path):
-            os.remove(video_path)
     return results
 
 
@@ -156,19 +119,24 @@ def run_video_ocr():
 
     try:
         if source.startswith("gs://"):
-            path = download_gcs_to_tempfile(source)
+            # turn GCS into signed URL for streaming
+            bucket_name, blob_name = source[5:].split("/", 1)
+            blob = storage_client.bucket(bucket_name).blob(blob_name)
+            blob.reload()
+            if blob.size and blob.size > MAX_VIDEO_SIZE:
+                return jsonify({"error": f"Video too large: {blob.size/1024/1024:.2f} MB"}), 400
+            video_url = blob.generate_signed_url(version="v4", expiration=3600, method="GET")
         elif "tiktok.com" in source:
-            path = download_tiktok_to_tempfile(source)
+            video_url = get_tiktok_direct_url(source)
         else:
             return jsonify({"error": "Unsupported source. Use gs:// or TikTok URL."}), 400
 
-        results = process_video_local(path)
+        results = process_video_stream(video_url)
         return jsonify(results)
 
     except ValueError as ve:
         return jsonify({"error": str(ve)}), 400
     except Exception as e:
-        # surface unexpected errors
         return jsonify({"error": f"Internal error: {str(e)}"}), 500
 
 
