@@ -124,7 +124,7 @@ def process_video_local(video_path: str):
 @app.route("/", methods=["POST"])
 def run_video_ocr():
     data = request.get_json(force=True)
-    source = data.get("gcs_uri") or data.get("tiktok_url")
+    source = data.get("video_uri")
 
     if not source:
         return jsonify({"error": "Missing gcs_uri or tiktok_url"}), 400
@@ -132,10 +132,8 @@ def run_video_ocr():
     try:
         if source.startswith("gs://"):
             video_path = download_gcs_to_tempfile(source)
-        elif "tiktok.com" in source:
-            video_path = download_tiktok_to_tempfile(source)
         else:
-            return jsonify({"error": "Unsupported source type"}), 400
+            video_path = download_tiktok_to_tempfile(source)
 
         results = process_video_local(video_path)
         return jsonify(results)
