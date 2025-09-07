@@ -1,8 +1,7 @@
 import tempfile
+import os
 from google.cloud import vision, storage
 import cv2
-import numpy as np
-import subprocess
 import re
 from flask import Flask, request, jsonify
 
@@ -10,6 +9,7 @@ app = Flask(__name__)
 FRAME_INTERVAL = 30
 BOTTOM_IGNORE_RATIO = 0.25
 UNWANTED = ["tiktok", "tik tok"]
+MAX_VIDEO_SIZE = 512 * 1024 * 1024  # 512 MB
 
 vision_client = vision.ImageAnnotatorClient()
 storage_client = storage.Client()
@@ -54,6 +54,14 @@ def download_gcs_to_tempfile(gcs_uri: str) -> str:
     bucket_name, blob_name = gcs_uri[5:].split("/", 1)
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
+
+    # size check
+    blob.reload()
+    if blob.size is None:
+        raise ValueError("Could not determine object size.")
+    if blob.size > MAX_VIDEO_SIZE:
+        raise ValueError(f"Video too large: {blob.size/1024/1024:.2f} MB (limit 512 MB)")
+
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     blob.download_to_filename(temp_file.name)
     return temp_file.name
@@ -68,23 +76,28 @@ def process_video_local(gcs_uri: str):
     last_text = None
     results = []
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_num % FRAME_INTERVAL == 0:
-            success, encoded = cv2.imencode(".jpg", frame)
-            if not success:
-                continue
-            image = vision.Image(content=encoded.tobytes())
-            response = vision_client.text_detection(image=image)
-            if response.full_text_annotation:
-                text = clean_text(response, height)
-                if text.strip() and text != last_text:
-                    results.append({"frame": frame_num, "text": text})
-                    last_text = text
-        frame_num += 1
-    cap.release()
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_num % FRAME_INTERVAL == 0:
+                success, encoded = cv2.imencode(".jpg", frame)
+                if not success:
+                    continue
+                image = vision.Image(content=encoded.tobytes())
+                response = vision_client.text_detection(image=image)
+                if response.full_text_annotation:
+                    text = clean_text(response, height)
+                    if text.strip() and text != last_text:
+                        results.append(text)
+                        last_text = text
+            frame_num += 1
+    finally:
+        cap.release()
+        if os.path.exists(video_path):
+            os.remove(video_path)
+
     return results
 
 
@@ -96,7 +109,10 @@ def run_video_ocr():
         return jsonify({"error": "Missing gcs_uri"}), 400
     try:
         results = process_video_local(gcs_uri)
-        return jsonify({"gcs_uri": gcs_uri, "results": results})
+        return jsonify(results)
+    except ValueError as ve:
+        # specifically catch large file error
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
