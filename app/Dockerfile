@@ -1,16 +1,14 @@
 FROM python:3.11-slim
 
-# Install system deps
+# system deps for OpenCV video I/O
 RUN apt-get update && apt-get install -y ffmpeg libsm6 libxext6 && rm -rf /var/lib/apt/lists/*
-RUN pip install yt-dlp
 
-# Install Python deps
+# python deps
 COPY requirements.txt .
+# include yt-dlp and opencv-python-headless
+# (plus google-cloud-vision, google-cloud-storage, flask, numpy, etc.)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
 COPY . /app
 WORKDIR /app
-
-# Run Flask app
 CMD ["python", "main.py"]

@@ -3,3 +3,4 @@ opencv-python-headless
 google-cloud-vision
 google-cloud-storage
 numpy
+yt-dlp
