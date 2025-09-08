@@ -78,18 +78,17 @@ def download_gcs_to_tempfile(gcs_uri: str) -> str:
 
 
 def download_tiktok_to_tempfile(url: str) -> str:
-    """Download TikTok video and convert to MP4 compatible with OpenCV."""
+    """Download TikTok video directly to MP4 via yt-dlp."""
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    converted_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
 
-    # Download via yt-dlp
     ydl_opts = {
         'format': 'mp4',
         'merge_output_format': 'mp4',
         'outtmpl': temp_file.name,
         'quiet': True,
-        'noplaylist': True
+        'noplaylist': True,
     }
+
     try:
         with YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -98,21 +97,15 @@ def download_tiktok_to_tempfile(url: str) -> str:
             os.remove(temp_file.name)
         raise ValueError(f"TikTok download failed: {str(e)}")
 
-    # Convert video with FFmpeg to ensure OpenCV compatibility
-    try:
-        subprocess.run([
-            "ffmpeg", "-i", temp_file.name, "-c:v", "libx264", "-c:a", "aac", "-y", converted_file.name
-        ], check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        raise ValueError(f"FFmpeg conversion failed: {e.stderr.decode()}")
-    finally:
-        if os.path.exists(temp_file.name):
-            os.remove(temp_file.name)
+    # Validate the file
+    if not os.path.exists(temp_file.name) or os.path.getsize(temp_file.name) == 0:
+        raise ValueError("TikTok download resulted in empty file.")
 
-    if os.path.getsize(converted_file.name) == 0:
-        raise ValueError("Converted TikTok video is empty.")
+    if os.path.getsize(temp_file.name) > MAX_VIDEO_SIZE:
+        os.remove(temp_file.name)
+        raise ValueError(f"TikTok video too large (> {MAX_VIDEO_SIZE/1024/1024:.0f} MB)")
 
-    return converted_file.name
+    return temp_file.name
 
 
 def process_video_local(video_path: str):
